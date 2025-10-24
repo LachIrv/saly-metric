@@ -5,21 +5,6 @@ This repository turns messy sales + GIS data into a **single, explainable score 
 
 ---
 
-## Table of Contents
-- [TL;DR (Plain English)](#tldr-plain-english)
-- [Quickstart](#quickstart)
-- [Running](#running)
-- [Outputs](#outputs)
-- [Method (with equations)](#method-with-equations)
-- [How to interpret SALY](#how-to-interpret-saly)
-- [Data & assumptions](#data--assumptions)
-- [Troubleshooting](#troubleshooting)
-- [Roadmap](#roadmap)
-- [Repo layout](#repo-layout)
-- [License](#license)
-
----
-
 ## TL;DR (Plain English)
 
 - **Input:** a property CSV (address, suburb, price, weekly_rent, vacancy…).  
@@ -32,7 +17,6 @@ This repository turns messy sales + GIS data into a **single, explainable score 
 ## Quickstart
 
 ```bash
-# venv (Ubuntu)
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -48,7 +32,7 @@ pip install -r requirements.txt
 python src/saly_calc.py --input data/sample_properties.csv --output data/saly_scores.csv
 ```
 
-**With real data:**
+**With your real data:**
 ```bash
 python src/saly_calc.py \
   --input data/properties_from_transactions.csv \
@@ -60,18 +44,20 @@ python src/saly_calc.py \
   --growth_years 5 --liq_years 2
 ```
 
+Notes:
+- Area labels are normalised with `strip().upper()` to reduce mismatches.
+- If your CSV has `orientation` (N/NE/…): that is used for sunlight; clear it to prefer the GIS proxy.
+
 ---
 
 ## Outputs
 
-Generate helper exports:
 ```bash
 python - <<'PY'
 import pandas as pd
 df = pd.read_csv("data/saly_scores.csv")
 df.nlargest(100, "SALY").to_csv("data/top_100_properties.csv", index=False)
-(df.groupby("suburb")["SALY"].mean()
-  .sort_values(ascending=False).head(25)
+(df.groupby("suburb")["SALY"].mean().sort_values(ascending=False).head(25)
 ).to_csv("data/top_suburbs.csv")
 print("Wrote data/top_100_properties.csv and data/top_suburbs.csv")
 PY
@@ -95,60 +81,51 @@ PY
 
 ## Method (with equations)
 
-### Components
-- **NOY** – Net Operating Yield (post vacancy & typical costs)  
-- **Growth** – Area median price **CAGR** from transactions (default 5-year lookback)  
-- **Liquidity** – Recent sales count by area (default 2-year window)  
-- **Vacancy** – Penalises higher vacancy  
-- **Sunlight** – From `orientation` (N/NE/…) or GIS road-bearing proxy (north ≈ better)  
-- **Frontage** – Road-touching boundary / parcel perimeter (proxy)  
-- **Risk** – Placeholder (0 for now; hook for flood/bushfire/heat)
-
 ### Notation
-- $P$: price  
-- $R_w$: weekly rent  
-- $v \in [0,1] \$: vacancy rate  
-- Annual costs = council + insurance + strata + maintenance\_pct × \(P\)
+- $P$ = price, $R_w$ = weekly rent, $v \in [0,1]$ = vacancy  
+- Annual costs = council + insurance + strata + maintenance\\_pct $\\times$ $P$
 
 ### 1) Net Operating Yield (NOY)
-Annual rent after vacancy: $R_a = 52\cdot R_w \cdot (1 - v)$
+Annual rent after vacancy: $R_a = 52\,R_w(1 - v)$
 
-$\text{NOY} = \frac{R_a - \text{annual_costs}}{P}$
+$$
+\\mathrm{NOY} = \\frac{R_a - \\mathrm{annual\\_costs}}{P}
+$$
 
 ### 2) Growth (CAGR by area)
-Compute median sale price per **area × year** from transactions; pick latest year \(Y_1\) and base \(Y_0\in\{Y_1-N,\text{earliest}\}\):
+Compute median sale price per **area × year**; choose latest year $Y_1$ and base $Y_0 \\in \\{Y_1-N,\\ \\text{earliest}\\}$:
 
-\[
-\text{CAGR} = \left(\frac{M_{Y_1}}{M_{Y_0}}\right)^{\frac{1}{Y_1 - Y_0}} - 1
-\]
+$$
+\\mathrm{CAGR}=\\left(\\frac{M_{Y_1}}{M_{Y_0}}\\right)^{\\tfrac{1}{Y_1 - Y_0}}-1
+$$
 
 ### 3) Liquidity (area activity)
-\[
-\text{Liquidity} = \#\{\text{sales in last } M \text{ years}\}
-\]
+$$
+\\mathrm{Liquidity}=\\#\\{\\text{sales in last } M \\text{ years}\\}
+$$
 
 ### 4) Sunlight proxy (0..1)
-Given a bearing \(\theta\) (North = 0° best), use:
+Given bearing $\\theta$ (North $=0^\\circ$ best):
 
-\[
-\text{Sun} = \frac{1 + \cos(\theta)}{2}
-\]
+$$
+\\mathrm{Sun}=\\frac{1+\\cos\\theta}{2}
+$$
 
-If `orientation` is absent, \(\theta\) is approximated from the longest road-boundary segment touching the parcel.
+If `orientation` is missing, $\\theta$ is approximated from the longest road-boundary segment touching the parcel.
 
 ### 5) Frontage proxy
-\[
-\text{FrontageRatio} = \frac{\text{road-boundary length}}{\text{parcel perimeter}}
-\]
+$$
+\\mathrm{FrontageRatio}=\\frac{\\text{road boundary length}}{\\text{parcel perimeter}}
+$$
 
 ### 6) Standardise & blend (transparent weights)
 Z-score numeric components within the dataset:
 
-\[
-z(x) = \frac{x - \mu_x}{\sigma_x}
-\]
+$$
+z(x)=\\frac{x-\\mu_x}{\\sigma_x}
+$$
 
-Weights:
+**Weights**
 
 | Feature       | Weight |
 |---------------|:------:|
@@ -160,55 +137,50 @@ Weights:
 | Sunlight      |  0.05  |
 | Frontage      |  0.05  |
 
-Composite (linear) score:
+Composite score:
 
-\[
-S = 0.40\,z(\text{NOY}) + 0.25\,z(\text{Growth}) + 0.15\,(1 - z(\text{Vacancy})) \\
-\quad + 0.10\,z(\text{Liquidity}) - 0.10\,z(\text{Risk}) + 0.05\,\text{Sun} + 0.05\,\text{Frontage}
-\]
+$$
+S=0.40\\,z(\\mathrm{NOY})+0.25\\,z(\\mathrm{Growth})+0.15\\,(1-z(\\mathrm{Vacancy}))+0.10\\,z(\\mathrm{Liquidity})-0.10\\,z(\\mathrm{Risk})+0.05\\,\\mathrm{Sun}+0.05\\,\\mathrm{Frontage}
+$$
 
 Scale to 0–100:
 
-\[
-\text{SALY} = 100 \cdot \frac{S - S_\min}{S_\max - S_\min}
-\quad (\text{flat input} \Rightarrow 50)
-\]
+$$
+\\mathrm{SALY}=100\\cdot\\frac{S-S_{\\min}}{S_{\\max}-S_{\\min}}
+$$
 
 ---
 
 ## How to interpret SALY
-- **Higher = better** *relative to your dataset*.  
-- SALY is for **prioritising** due-diligence, not replacing it.  
-- Inspect components (NOY, Growth, Liquidity, Vacancy, Sun, Frontage, Risk) to understand *why* a property ranks high/low.
+- **Higher = better** (relative to your dataset).  
+- Use SALY to **prioritise** due-diligence, not replace it.  
+- Inspect components to understand *why* a property ranks high/low.
 
 ---
 
 ## Data & assumptions
 - If `weekly_rent` is missing, rent may be estimated from price × (~4–4.5% gross) ÷ 52 (approximate).  
 - Default vacancy is 5% unless provided.  
-- Growth/Liquidity are **area-level** (typically suburb); labels are normalised (`strip().upper()`).  
-- GIS sunlight/frontage are **proxies**; precise parcel sunlight needs a robust address→parcel join.  
-- Risk is a placeholder (0) until hazard layers are added.
+- Growth/Liquidity are area-level (typically suburb).  
+- GIS sunlight/frontage are proxies; precise parcel sunlight needs a robust address→parcel join.  
+- Risk is 0 until hazard layers are added.
 
 ---
 
 ## Troubleshooting
-- **Growth identical for many rows?**  
-  All top properties may share one area, or area labels didn’t match transactions; normalisation reduces this.  
-- **No GIS effect?**  
-  If `orientation` has values (e.g., “N”), it overrides GIS. Clear it to use GIS proxies.  
-- **Ubuntu venv errors?**  
-  `sudo apt install python3-venv`, then use the venv.
+- **Identical Growth values?** Same area or label mismatches; we normalise labels but check inputs.  
+- **No GIS effect?** If `orientation` is filled (e.g., “N”), it overrides GIS.  
+- **Ubuntu venv errors?** `sudo apt install python3-venv`, then re-create the venv.
 
 ---
 
 ## Roadmap
-- Add flood/bushfire/heat risk and include in the blend  
-- Parcel-level sunlight + frontage via robust address→parcel matching  
-- Hedonic rent model (instead of flat yield heuristic)  
+- Add flood/bushfire/heat risk and include in blend  
+- Parcel-level sunlight + frontage with stronger address→parcel matching  
+- Hedonic rent model  
 - Suburb↔SA3 hierarchical smoothing for Growth  
-- Backtests and weight calibration; confidence intervals  
-- Small interactive dashboard with per-property explanations
+- Backtests, weight calibration, confidence intervals  
+- Small interactive dashboard
 
 ---
 
@@ -220,8 +192,6 @@ data/                     # inputs/outputs (heavy files are usually gitignored)
 notebooks/demo.ipynb      # optional EDA / demo
 docs/logic.md             # rationale, formulas, weights
 ```
-
----
 
 ## License
 MIT (or update to your preferred license).
