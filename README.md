@@ -105,13 +105,13 @@ PY
 - **Risk** – Placeholder (0 for now; hook for flood/bushfire/heat)
 
 ### Notation
-- $\( P \)$: price  
-- \( R_w \): weekly rent  
+- $P$: price  
+- $R_w$: weekly rent  
 - \( v \in [0,1] \): vacancy rate  
 - Annual costs = council + insurance + strata + maintenance\_pct × \(P\)
 
 ### 1) Net Operating Yield (NOY)
-Annual rent after vacancy: \( R_a = 52\cdot R_w \cdot (1 - v) \)
+Annual rent after vacancy: $R_a = 52\cdot R_w \cdot (1 - v)$
 
 \[
 \text{NOY} = \frac{R_a - \text{annual\_costs}}{P}
