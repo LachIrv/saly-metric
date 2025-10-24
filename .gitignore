@@ -11,5 +11,3 @@ notebooks/.ipynb_checkpoints/
 data/*.parquet
 data/*.gpkg
 data/saly_scores.csv
-data/top_100_properties.csv
-data/top_suburbs.csv
