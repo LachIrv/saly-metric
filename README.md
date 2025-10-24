@@ -48,7 +48,7 @@ pip install -r requirements.txt
 python src/saly_calc.py --input data/sample_properties.csv --output data/saly_scores.csv
 ```
 
-**With your real data:**
+**With real data:**
 ```bash
 python src/saly_calc.py \
   --input data/properties_from_transactions.csv \
@@ -59,10 +59,6 @@ python src/saly_calc.py \
   --roads data/roads.gpkg \
   --growth_years 5 --liq_years 2
 ```
-
-Notes:
-- The script normalises area labels with `strip().upper()` to reduce suburb/area mismatches.
-- If your CSV has `orientation` (N/NE/…): that will be used for sunlight; leave it empty to prefer the GIS proxy.
 
 ---
 
