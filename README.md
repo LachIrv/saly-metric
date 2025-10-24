@@ -113,9 +113,7 @@ PY
 ### 1) Net Operating Yield (NOY)
 Annual rent after vacancy: $R_a = 52\cdot R_w \cdot (1 - v)$
 
-$
-\text{NOY} = \frac{R_a - \text{annual\_costs}}{P}
-$
+$\text{NOY} = \frac{R_a - \text{annual\_costs}}{P}$
 
 ### 2) Growth (CAGR by area)
 Compute median sale price per **area × year** from transactions; pick latest year \(Y_1\) and base \(Y_0\in\{Y_1-N,\text{earliest}\}\):
