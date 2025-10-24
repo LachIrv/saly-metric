@@ -105,7 +105,7 @@ PY
 - **Risk** – Placeholder (0 for now; hook for flood/bushfire/heat)
 
 ### Notation
-- \( P \): price  
+- $\( P \)$: price  
 - \( R_w \): weekly rent  
 - \( v \in [0,1] \): vacancy rate  
 - Annual costs = council + insurance + strata + maintenance\_pct × \(P\)
