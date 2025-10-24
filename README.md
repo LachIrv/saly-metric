@@ -5,7 +5,7 @@ This repository turns messy sales + GIS data into a **single, explainable score 
 
 ---
 
-## TL;DR (Plain English)
+## TL;DR
 
 - **Input:** a property CSV (address, suburb, price, weekly_rent, vacancy…).  
   **Optional:** `transactions.parquet` (sales history), and GIS files `gnaf_prop.parquet` + `cadastre.gpkg` + `roads.gpkg`.
