@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+notebooks/.ipynb_checkpoints/
+
+# local data (keep repo lean)
+data/*.parquet
+data/*.gpkg
+data/saly_scores.csv
+data/top_100_properties.csv
+data/top_suburbs.csv
