@@ -1,91 +1,120 @@
-
 #!/usr/bin/env python3
 """
-SALY scoring CLI (enhanced)
-- Reads a property CSV (--input)
-- Optionally ingests transactions.parquet, gnaf_prop.parquet, cadastre.gpkg, roads.gpkg
-- Computes: NOY, Growth, Vacancy, Liquidity, Risk (placeholder), Sunlight, Frontage
-- Outputs a scored CSV (--output) with SALY 0–100 and components
+SALY (Sunlight-Adjusted, risk-Adjusted Yield) – human-friendly, commented script.
 
-Example:
-  python src/saly_calc.py --input data/sample_properties.csv --output data/saly_scores.csv \
-    --transactions /path/transactions.parquet --gnaf /path/gnaf_prop.parquet \
-    --cadastre /path/cadastre.gpkg --roads /path/roads.gpkg
+What this script does (high level):
+1) Read a CSV of properties you want to score (address, suburb, price, weekly_rent, etc.).
+2) (Optional) Read transactions.parquet to compute LOCAL price growth (CAGR) and market liquidity.
+3) (Optional) Read GNAF + Cadastre + Roads to estimate a sunlight score and frontage proxy.
+4) Compute component features: NOY (net operating yield), growth, vacancy, liquidity, sunlight, frontage.
+5) Blend z-scored features with weights, scale to a 0–100 SALY score, and save a ranked CSV.
+
+Usage examples:
+  # minimal (works with sample CSV)
+  python src/saly_calc.py --input data/sample_properties.csv --output data/saly_scores.csv
+
+  # full (uses your datasets)
+  python src/saly_calc.py \
+      --input data/properties_from_transactions.csv \
+      --output data/saly_scores.csv \
+      --transactions data/transactions.parquet \
+      --gnaf data/gnaf_prop.parquet \
+      --cadastre data/cadastre.gpkg \
+      --roads data/roads.gpkg \
+      --growth_years 5 --liq_years 2
 """
 
-import argparse
-import math
-import sys
-from typing import Optional, Tuple, Dict, List
+from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+# --- stdlib and third-party imports ---
+import argparse          # tidy command-line parsing
+import math              # bearings & cosine for sunlight
+import sys               # printing warnings to stderr
+from typing import Optional, List
 
-# Geospatial imports are optional; only used if files provided
+import numpy as np       # numeric ops
+import pandas as pd      # tabular data
+
+# Geo stack is optional; we keep the script usable without it
 try:
     import geopandas as gpd
-    from shapely.geometry import Point, LineString, Polygon
+    from shapely.geometry import LineString
     HAS_GEO = True
 except Exception:
     HAS_GEO = False
 
-# ----------------------- Helpers -----------------------
 
-def _z(s: pd.Series) -> pd.Series:
+# ──────────────────────────────────────────────────────────────────────────────
+# Small utilities (kept simple & well-commented)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def pick_first(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Return the first column name that exists in df from a priority-ordered list."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def zscore(s: pd.Series) -> pd.Series:
+    """Standard z-score with safe fallbacks (NaN/zero-variance handled)."""
     s = pd.to_numeric(s, errors="coerce")
     mu, sd = s.mean(skipna=True), s.std(skipna=True)
     if pd.isna(sd) or sd == 0:
         return pd.Series(np.zeros(len(s)), index=s.index)
     return (s - mu) / sd
 
-def _minmax01(s: pd.Series) -> pd.Series:
+
+def scale_0_100(s: pd.Series) -> pd.Series:
+    """Min-max scale to a friendly 0–100 range (flat input -> all 50)."""
     s = pd.to_numeric(s, errors="coerce")
     mn, mx = s.min(skipna=True), s.max(skipna=True)
-    if pd.isna(mn) or pd.isna(mx) or mx == mn:
-        return pd.Series(np.full(len(s), 0.5), index=s.index)
-    return (s - mn) / (mx - mn)
+    if pd.isna(mn) or pd.isna(mx) or mn == mx:
+        return pd.Series(np.full(len(s), 50.0), index=s.index)
+    return 100.0 * (s - mn) / (mx - mn)
 
-def _minmax0100(s: pd.Series) -> pd.Series:
-    return 100.0 * _minmax01(s)
 
-def _first_present(d: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in d.columns:
-            return c
-    return None
-
-def _bearing_from_linestring(ls: LineString) -> Optional[float]:
+def bearing_from_linestring(ls: Optional[LineString]) -> Optional[float]:
+    """
+    Estimate a single bearing (degrees from North, clockwise) for a LineString.
+    We simplify by using the line endpoints; good enough as a proxy.
+    """
+    if ls is None:
+        return None
     try:
-        x0, y0, x1, y1 = None, None, None, None
-        # Use first and last coord for an overall bearing
-        coords = list(ls.coords)
-        if len(coords) < 2:
-            return None
-        (x0, y0), (x1, y1) = coords[0], coords[-1]
-        dx, dy = x1 - x0, y1 - y0
-        # Bearing from North (0 deg) clockwise: atan2(dx, dy)
-        ang = math.degrees(math.atan2(dx, dy)) % 360.0
+        (x0, y0), (x1, y1) = list(ls.coords)[0], list(ls.coords)[-1]
+        # Note: atan2(dx, dy) gives angle from North when we treat dy as "northing"
+        ang = math.degrees(math.atan2(x1 - x0, y1 - y0)) % 360.0
         return ang
     except Exception:
         return None
 
-def _sun_from_bearing_deg(ang: Optional[float]) -> float:
-    """Return sunlight score in [0,1], where 1 is north-facing (0°), 0 is south (180°)."""
+
+def sun_from_bearing_deg(ang: Optional[float]) -> float:
+    """
+    Convert a bearing angle to a sunlight score in [0,1].
+    We assume North=best sun in AU; simple proxy using cosine of the angle from North.
+    """
     if ang is None:
         return 0.0
-    # transform: (1 + cos(theta_rad)) / 2  with theta measured from North
-    rad = math.radians(ang)
-    return (1.0 + math.cos(rad)) / 2.0
+    return (1 + math.cos(math.radians(ang))) / 2.0
 
-def _sun_from_cardinal(txt: str) -> float:
-    orient_deg = {
+
+def sun_from_cardinal(txt: str) -> float:
+    """Map N/NE/E/… to a bearing, then to a sun score. Unknown -> 0."""
+    mapping = {
         "N": 0, "NE": 45, "E": 90, "SE": 135,
         "S": 180, "SW": 225, "W": 270, "NW": 315
     }
-    ang = orient_deg.get(str(txt).strip().upper(), None)
-    return _sun_from_bearing_deg(ang)
+    ang = mapping.get(str(txt).strip().upper(), None)
+    return sun_from_bearing_deg(ang)
 
-def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+
+def ensure_property_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure the input CSV has the columns we need.
+    If missing, create with reasonable defaults so the pipeline is robust.
+    """
     defaults = {
         "address": "",
         "suburb": "",
@@ -97,317 +126,325 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
         "strata_fees_pa": 0.0,
         "maintenance_pct": 0.01,
         "days_on_market": np.nan,
-        "orientation": ""
+        "orientation": "",
     }
+    out = df.copy()
     for c, v in defaults.items():
-        if c not in df.columns:
-            df[c] = v
-    return df
+        if c not in out.columns:
+            out[c] = v
+    return out
 
-# ---------------- Transactions-derived features ----------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core feature engineering
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_noy(properties: pd.DataFrame) -> pd.Series:
+    """
+    Net Operating Yield = (rent*(1 - vacancy) − annual costs) / price
+    - rent = weekly_rent * 52
+    - vacancy = vacancy_rate (0.05 default)
+    - annual costs = council + insurance + strata + maintenance_pct * price
+    """
+    price = pd.to_numeric(properties["price"], errors="coerce")
+    rent_week = pd.to_numeric(properties["weekly_rent"], errors="coerce").fillna(0)
+    vacancy = pd.to_numeric(properties.get("vacancy_rate", 0.05), errors="coerce").fillna(0.05)
+
+    council = pd.to_numeric(properties.get("council_rates_pa", 1800.0), errors="coerce").fillna(1800.0)
+    insurance = pd.to_numeric(properties.get("insurance_pa", 1200.0), errors="coerce").fillna(1200.0)
+    strata = pd.to_numeric(properties.get("strata_fees_pa", 0.0), errors="coerce").fillna(0.0)
+    maint_pct = pd.to_numeric(properties.get("maintenance_pct", 0.01), errors="coerce").fillna(0.01)
+
+    annual_rent = rent_week * 52.0 * (1 - vacancy)
+    annual_costs = council + insurance + strata + maint_pct * price
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        noy = (annual_rent - annual_costs) / price
+
+    # Replace infinities/NaNs with 0 so the pipeline never crashes
+    return noy.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
 
 def load_transactions(path: Optional[str]) -> Optional[pd.DataFrame]:
+    """
+    Read transactions parquet and standardise the 3 essentials:
+      price_std  – numeric price
+      date_std   – pandas datetime
+      area_std   – area grouping (suburb/SA3/LGA/etc) for growth/liquidity
+    We support a bunch of common column names to handle schema differences.
+    """
     if not path:
         return None
+
     try:
-        df = pd.read_parquet(path)
+        raw = pd.read_parquet(path)
     except Exception as e:
-        print(f"[warn] failed to read transactions from {path}: {e}", file=sys.stderr)
+        print(f"[warn] failed to read transactions: {e}", file=sys.stderr)
         return None
 
-    # Standardize likely column names
-    price_col = _first_present(df, ["price","PRICE","sale_price","contract_price","amount"])
-    date_col  = _first_present(df, ["sale_date","contract_date","settlement_date","date","date_sold","DATE_SOLD","dat","DAT"])
-    area_col  = _first_present(df, ["suburb","SUBURB","sa3","SA3","lga","LGA","postcode","POSTCODE","area","AREA"])
+    # Try to find equivalent columns by priority
+    price_col = pick_first(raw, ["price", "PRICE", "sale_price", "contract_price", "amount"])
+    date_col  = pick_first(raw, ["sale_date", "contract_date", "settlement_date", "date",
+                                 "date_sold", "DATE_SOLD", "dat", "DAT"])
+    area_col  = pick_first(raw, ["suburb", "SUBURB", "sa3", "SA3", "lga", "LGA",
+                                 "postcode", "POSTCODE", "area", "AREA"])
 
     if not price_col or not date_col:
-        print("[warn] transactions missing required columns price/date; skipping growth/liquidity.", file=sys.stderr)
+        # Graceful fallback: we can still score without growth/liquidity
+        print("[warn] transactions missing price/date; skipping growth/liquidity.", file=sys.stderr)
         return None
 
-    df = df.copy()
+    df = raw.copy()
     df["price_std"] = pd.to_numeric(df[price_col], errors="coerce")
-    df["date_std"] = pd.to_datetime(df[date_col], errors="coerce")
-    if area_col:
-        df["area_std"] = df[area_col].astype(str)
-    else:
-        df["area_std"] = "ALL"
+    df["date_std"]  = pd.to_datetime(df[date_col], errors="coerce")
+    df["area_std"]  = df[area_col].astype(str) if area_col else "ALL"
 
-    df = df.dropna(subset=["price_std","date_std"])
-    return df[["price_std","date_std","area_std"]]
+    df = df.dropna(subset=["price_std", "date_std"])
+    return df[["price_std", "date_std", "area_std"]]
 
-def compute_growth(trans: pd.DataFrame, years:int=5) -> pd.Series:
-    """Compute CAGR by area over `years` lookback, returns mapping area->growth (float)."""
+
+def compute_growth(trans: pd.DataFrame, years: int = 5) -> pd.Series:
+    """
+    Compute area-level CAGR from median prices.
+    Steps:
+      1) Median price per area×year.
+      2) CAGR between latest year and (latest - years) or earliest available.
+    Returns: Series indexed by area_std with CAGR values in decimal (e.g., 0.05 = 5%)
+    """
     if trans is None or trans.empty:
         return pd.Series(dtype=float)
-    # pivot median price by year
+
     t = trans.copy()
     t["year"] = t["date_std"].dt.year
-    gp = t.groupby(["area_std","year"])["price_std"].median().unstack()
-    if gp.shape[1] < 2:
-        return pd.Series(dtype=float)
-    max_year = gp.columns.max()
-    base_year = max_year - years
-    if base_year not in gp.columns:
-        # pick earliest available as base
-        base_year = gp.columns.min()
-    try:
-        ratio = gp[max_year] / gp[base_year]
-        cagr = ratio.pow(1.0 / (max_year - base_year)) - 1.0
-        cagr = cagr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        return cagr
-    except Exception:
+
+    # Table: rows=area, cols=year, values=median price
+    med = t.groupby(["area_std", "year"])["price_std"].median().unstack()
+
+    if med.shape[1] < 2:
         return pd.Series(dtype=float)
 
-def compute_liquidity(trans: pd.DataFrame, window_years:int=2) -> pd.Series:
-    """Recent sales count by area (last `window_years` years)."""
+    latest_year = med.columns.max()
+    base_year = max(med.columns.min(), latest_year - years)
+
+    ratio = (med[latest_year] / med[base_year]).replace([np.inf, -np.inf], np.nan)
+    cagr = ratio.pow(1.0 / (latest_year - base_year)).fillna(1.0) - 1.0
+    return cagr.fillna(0.0)
+
+
+def compute_liquidity(trans: pd.DataFrame, window_years: int = 2) -> pd.Series:
+    """
+    Liquidity proxy = count of recent sales per area (last N years).
+    Higher = more active market (easier to enter/exit).
+    """
     if trans is None or trans.empty:
         return pd.Series(dtype=float)
-    t = trans.copy()
-    cutoff = t["date_std"].max() - pd.Timedelta(days=365*window_years)
-    recent = t[t["date_std"] >= cutoff]
-    liq = recent.groupby("area_std")["price_std"].count().astype(float)
-    return liq
 
-# ---------------- Frontage & Orientation from GIS ----------------
+    cutoff = trans["date_std"].max() - pd.Timedelta(days=365 * window_years)
+    recent = trans[trans["date_std"] >= cutoff]
+    return recent.groupby("area_std")["price_std"].count().astype(float)
 
-def compute_frontage_orientation(
+
+def frontage_and_sunlight_from_gis(
     gnaf_path: Optional[str],
     cad_path: Optional[str],
-    roads_path: Optional[str]
+    roads_path: Optional[str],
 ) -> Optional[pd.DataFrame]:
-    if not HAS_GEO:
-        print("[info] Geo stack unavailable; skipping frontage/orientation.", file=sys.stderr)
+    """
+    VERY simple frontage/sunlight proxy from GIS:
+      - For each cadastre polygon, intersect boundary with nearby road lines.
+      - Sum intersection length (frontage proxy) and take bearing of longest segment.
+      - Convert that bearing to a [0,1] sunlight score assuming North=best.
+
+    NOTE: This is a lightweight proxy. A production model would join addresses to exact parcels
+          and compute per-property values. Here we fall back to dataset means if joins are hard.
+    """
+    if not (HAS_GEO and gnaf_path and cad_path and roads_path):
         return None
-    if not (gnaf_path and cad_path and roads_path):
-        return None
+
     try:
         gnaf = pd.read_parquet(gnaf_path)
-    except Exception as e:
-        print(f"[warn] failed to read GNAF: {e}", file=sys.stderr); return None
-    try:
         cad = gpd.read_file(cad_path)
         roads = gpd.read_file(roads_path)
     except Exception as e:
-        print(f"[warn] failed to read GPKG files: {e}", file=sys.stderr); return None
-
-    # Standardize GNAF coordinates
-    lon_col = _first_present(gnaf, ["lon","longitude","x","LONGITUDE","LONG","LONGITUDE_DD"])
-    lat_col = _first_present(gnaf, ["lat","latitude","y","LATITUDE","LAT","LATITUDE_DD"])
-    if not lon_col or not lat_col:
-        print("[warn] GNAF missing lon/lat; cannot spatially join.", file=sys.stderr)
+        print(f"[warn] GIS read failed: {e}", file=sys.stderr)
         return None
 
-    # Create GeoDataFrame for addresses in CRS of cadastre
+    # Find lon/lat columns in GNAF
+    lon = pick_first(gnaf, ["lon", "longitude", "x", "LONGITUDE", "LONG"])
+    lat = pick_first(gnaf, ["lat", "latitude", "y", "LATITUDE", "LAT"])
+    if not lon or not lat:
+        return None
+
+    # Build GeoDataFrames in a common CRS (use cadastre CRS if present)
     gnaf_gdf = gpd.GeoDataFrame(
-        gnaf,
-        geometry=gpd.points_from_xy(gnaf[lon_col], gnaf[lat_col]),
-        crs="EPSG:4326"
+        gnaf, geometry=gpd.points_from_xy(gnaf[lon], gnaf[lat]), crs="EPSG:4326"
     )
-    if cad.crs is None:
-        cad = cad.set_crs("EPSG:4326", allow_override=True)
+    cad = cad if cad.crs else cad.set_crs("EPSG:4326")
     gnaf_gdf = gnaf_gdf.to_crs(cad.crs)
     roads = roads.to_crs(cad.crs)
 
-    # Spatial join addresses to cadastre polygons
+    # Join addresses to cadastre polygons (rough check)
     try:
         joined = gpd.sjoin(gnaf_gdf, cad[["geometry"]], how="inner", predicate="within")
     except Exception:
-        # Some geopandas versions use op=within
+        # for older geopandas versions
         joined = gpd.sjoin(gnaf_gdf, cad[["geometry"]], how="inner", op="within")
 
-    # For each polygon, compute frontage length and bearing of the longest road-intersection segment
-    # Build an index of polygon -> boundary
+    # Pre-compute polygon boundaries
+    cad = cad.copy()
     cad["boundary"] = cad.geometry.boundary
-    results = []
 
-    # To speed up, pre-filter roads near each polygon via bounding box (spatial index)
-    try:
-        roads_sindex = roads.sindex
-    except Exception:
-        roads_sindex = None
+    # Spatial index on roads for speed (if available)
+    sidx = getattr(roads, "sindex", None)
 
-    for idx, poly in cad.iterrows():
+    rows = []
+    for i, poly in cad.iterrows():
         boundary = poly["boundary"]
         if boundary is None:
             continue
-        # candidate roads by bbox
-        if roads_sindex is not None:
-            cand_idx = list(roads_sindex.intersection(poly.geometry.bounds))
-            rds = roads.iloc[cand_idx]
-        else:
-            rds = roads
 
-        # Compute intersections
-        max_len = 0.0
-        max_ls = None
+        # Restrict candidate roads to the polygon's bbox to keep it quick
+        if sidx is not None:
+            cand = roads.iloc[list(sidx.intersection(poly.geometry.bounds))]
+        else:
+            cand = roads
+
+        # Intersect road lines with polygon boundary and accumulate
         total_len = 0.0
-        for _, r in rds.iterrows():
+        longest_seg = None
+        longest_len = 0.0
+
+        for _, r in cand.iterrows():
             inter = boundary.intersection(r.geometry)
-            if inter.is_empty:
-                continue
-            if inter.geom_type == "MultiLineString":
+            # handle LineString and MultiLineString uniformly
+            if getattr(inter, "geoms", None):
                 segs = list(inter.geoms)
-            elif inter.geom_type == "LineString":
+            elif getattr(inter, "geom_type", "") == "LineString":
                 segs = [inter]
             else:
-                continue
+                segs = []
+
             for seg in segs:
-                seg_len = float(seg.length)
-                total_len += seg_len
-                if seg_len > max_len:
-                    max_len = seg_len
-                    max_ls = seg
+                L = float(seg.length)
+                total_len += L
+                if L > longest_len:
+                    longest_len = L
+                    longest_seg = seg
 
-        bearing = _bearing_from_linestring(max_ls) if max_ls is not None else None
-        sun_score = _sun_from_bearing_deg(bearing)
+        # Convert the longest segment to a bearing & then a sun score
+        bearing = bearing_from_linestring(longest_seg)
+        sun_geo = sun_from_bearing_deg(bearing)
 
-        # Perimeter to normalize frontage ratio
-        perim = float(boundary.length) if boundary is not None else np.nan
-        frontage_ratio = (total_len / perim) if (perim and perim > 0) else 0.0
+        perimeter = float(boundary.length) if boundary is not None else np.nan
+        frontage_ratio = (total_len / perimeter) if (perimeter and perimeter > 0) else 0.0
 
-        results.append({
-            "cad_index": idx,
-            "frontage_len": total_len,
-            "frontage_ratio": frontage_ratio,
-            "bearing_deg": bearing,
-            "sun_score_geo": sun_score
-        })
+        rows.append({"cad_index": i, "frontage_ratio": frontage_ratio, "sun_geo": sun_geo})
 
-    res_df = pd.DataFrame(results)
-    if res_df.empty:
-        return None
+    return pd.DataFrame(rows)
 
-    # Map each address point to its cad_index (from spatial join)
-    if "index_right" in joined.columns:
-        addr_to_cad = joined.set_index(joined.index)["index_right"].to_frame(name="cad_index")
-        addr_to_cad["row_id"] = joined.index
-        addr_to_cad = addr_to_cad.reset_index(drop=True)
-    else:
-        return res_df
 
-    # Aggregate address-level mapping (many points may map to same poly)
-    return res_df
+# ──────────────────────────────────────────────────────────────────────────────
+# Main program
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ---------------- SALY main ----------------
-
-def compute_noy(df: pd.DataFrame) -> pd.Series:
-    price = pd.to_numeric(df["price"], errors="coerce")
-    rent_week = pd.to_numeric(df["weekly_rent"], errors="coerce").fillna(0)
-    vac = pd.to_numeric(df.get("vacancy_rate", 0.05), errors="coerce").fillna(0.05)
-    # Costs
-    council = pd.to_numeric(df.get("council_rates_pa", 1800.0), errors="coerce").fillna(1800.0)
-    insurance = pd.to_numeric(df.get("insurance_pa", 1200.0), errors="coerce").fillna(1200.0)
-    strata = pd.to_numeric(df.get("strata_fees_pa", 0.0), errors="coerce").fillna(0.0)
-    maint_pct = pd.to_numeric(df.get("maintenance_pct", 0.01), errors="coerce").fillna(0.01)
-
-    annual_rent = rent_week * 52.0 * (1 - vac)
-    annual_costs = council + insurance + strata + maint_pct * price
-    with np.errstate(divide="ignore", invalid="ignore"):
-        noy = (annual_rent - annual_costs) / price
-    noy = noy.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return noy
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Property CSV")
-    ap.add_argument("--output", required=True, help="Output CSV with scores")
-    ap.add_argument("--transactions", help="transactions.parquet")
-    ap.add_argument("--gnaf", help="gnaf_prop.parquet")
-    ap.add_argument("--cadastre", help="cadastre.gpkg")
-    ap.add_argument("--roads", help="roads.gpkg")
-    ap.add_argument("--growth_years", type=int, default=5)
-    ap.add_argument("--liq_years", type=int, default=2)
+def main() -> int:
+    # ---- 1) Arguments ----
+    ap = argparse.ArgumentParser(description="Compute SALY 0–100 scores for a property CSV.")
+    ap.add_argument("--input", required=True, help="Property CSV (address, suburb, price, weekly_rent, ...)")
+    ap.add_argument("--output", required=True, help="Output CSV to write with scores")
+    ap.add_argument("--transactions", help="transactions.parquet (for growth/liquidity)")
+    ap.add_argument("--gnaf", help="gnaf_prop.parquet (addresses)")
+    ap.add_argument("--cadastre", help="cadastre.gpkg (property polygons)")
+    ap.add_argument("--roads", help="roads.gpkg (road centerlines)")
+    ap.add_argument("--growth_years", type=int, default=5, help="Lookback years for CAGR (default 5)")
+    ap.add_argument("--liq_years", type=int, default=2, help="Window for recent-sales liquidity (default 2)")
     args = ap.parse_args()
 
-    # Load properties
-    props = pd.read_csv(args.input)
-    props = _ensure_cols(props)
+    # ---- 2) Read properties & ensure required columns exist ----
+    props_raw = pd.read_csv(args.input)
+    props = ensure_property_columns(props_raw)
 
-    # Base features
-    props["NOY"] = compute_noy(props)
-    props["VACANCY"] = pd.to_numeric(props.get("vacancy_rate", 0.05), errors="coerce").fillna(0.05)
-    props["LIQ_DOM_RAW"] = -pd.to_numeric(props.get("days_on_market", np.nan), errors="coerce")  # lower DOM = better
+    # ---- 3) Compute primary features on the properties table ----
+    props["NOY"] = compute_noy(props)                                   # yield
+    props["VACANCY"] = pd.to_numeric(props["vacancy_rate"], errors="coerce").fillna(0.05)
 
-    # Sunlight from provided orientation text (fallback)
-    props["SUN_TXT"] = props.get("orientation", "").astype(str)
-    props["SUN_TXT_SCORE"] = props["SUN_TXT"].apply(_sun_from_cardinal)
+    # Sunlight from text orientation if present (N/NE/…); GIS can override later
+    props["SUN_TXT_SCORE"] = props["orientation"].astype(str).apply(sun_from_cardinal)
 
-    # Transactions -> Growth & Liquidity by area (use 'suburb' if present)
+    # Area key for growth/liquidity mapping (prefer suburb; fall back to "ALL")
+    props["area_std"] = props.get("suburb", "ALL").astype(str)
+
+    # ---- 4) Transactions → growth & liquidity ----
     trans = load_transactions(args.transactions)
     growth_map = compute_growth(trans, years=args.growth_years) if trans is not None else pd.Series(dtype=float)
-    liq_map = compute_liquidity(trans, window_years=args.liq_years) if trans is not None else pd.Series(dtype=float)
+    liq_map    = compute_liquidity(trans, window_years=args.liq_years)  if trans is not None else pd.Series(dtype=float)
 
-    # area key
-    area_series = props.get("suburb", pd.Series(["ALL"] * len(props)))
-    props["area_std"] = area_series.astype(str)
-
-    props["GROWTH"] = props["area_std"].map(growth_map).fillna(growth_map.mean() if not growth_map.empty else 0.0)
+    # Map area-level values to each property (fill with mean if missing)
+    props["GROWTH"]    = props["area_std"].map(growth_map).fillna(growth_map.mean() if not growth_map.empty else 0.0)
     props["LIQ_SALES"] = props["area_std"].map(liq_map).fillna(liq_map.mean() if not liq_map.empty else 0.0)
 
-    # Risk placeholder (set 0; you can map hazards here later)
+    # Risk placeholder for now (0 = neutral). Plug hazard datasets here later.
     props["RISK"] = 0.0
 
-    # Optional: GIS-derived frontage/orientation (if files exist)
-    if args.gnaf and args.cadastre and args.roads:
-        res_df = compute_frontage_orientation(args.gnaf, args.cadastre, args.roads)
-        if res_df is not None and not res_df.empty:
-            # We don't have a direct join key; use averages as global bonuses
-            props["FRONTAGE_RATIO"] = res_df["frontage_ratio"].mean()
-            props["SUN_GEO_SCORE"] = res_df["sun_score_geo"].mean()
-        else:
-            props["FRONTAGE_RATIO"] = 0.0
-            props["SUN_GEO_SCORE"] = np.nan
+    # ---- 5) Optional GIS frontage/sunlight proxy (dataset-level fallback) ----
+    geo = frontage_and_sunlight_from_gis(args.gnaf, args.cadastre, args.roads)
+    if geo is not None and not geo.empty:
+        # For this quick pass we use dataset averages; a follow-up could compute per-address joins.
+        props["FRONTAGE_RATIO"] = float(geo["frontage_ratio"].mean())
+        props["SUN_GEO_SCORE"]  = float(geo["sun_geo"].mean())
     else:
         props["FRONTAGE_RATIO"] = 0.0
-        props["SUN_GEO_SCORE"] = np.nan
+        props["SUN_GEO_SCORE"]  = np.nan
 
-    # Final Sun Score preference: explicit text orientation > GIS avg > 0
-    props["SUN_SCORE"] = props["SUN_TXT_SCORE"]
-    props["SUN_SCORE"] = np.where(props["SUN_SCORE"].isna() | (props["SUN_SCORE"] == 0), props["SUN_GEO_SCORE"], props["SUN_SCORE"])
-    props["SUN_SCORE"] = props["SUN_SCORE"].fillna(0.0)
+    # Prefer explicit text orientation; if it's absent/zero, use GIS score; otherwise 0.
+    props["SUN_SCORE"] = pd.Series(np.where(props["SUN_TXT_SCORE"].fillna(0)==0, props["SUN_GEO_SCORE"], props["SUN_TXT_SCORE"]), index=props.index).fillna(0.0)
 
-    # ---------------- Blend & Scale ----------------
-    # Z-score within dataset (simple global z)
-    z_noy = _z(props["NOY"])
-    z_growth = _z(props["GROWTH"])
-    z_vac = _z(props["VACANCY"])
-    z_liq = _z(props["LIQ_SALES"] if props["LIQ_SALES"].notna().any() else props["LIQ_DOM_RAW"])
-    z_risk = _z(props["RISK"])
+    # ---- 6) Blend features into a single, readable score ----
+    # z-score the numeric components so each weight is comparable
+    z_noy     = zscore(props["NOY"])
+    z_growth  = zscore(props["GROWTH"])
+    z_vac     = zscore(props["VACANCY"])
+    z_liq     = zscore(props["LIQ_SALES"])
+    z_risk    = zscore(props["RISK"])
 
-    # Weights
+    # Transparent weights (sum to ~1; risk negative)
     W = {
         "NOY": 0.40,
         "GROWTH": 0.25,
-        "VACANCY": 0.15,   # enters as (1 - z_vac)
+        "VACANCY": 0.15,   # we flip sign below (1 - z_vac) so higher vacancy reduces score
         "LIQUIDITY": 0.10,
-        "RISK": -0.10,     # negative weight
+        "RISK": -0.10,
         "SUN": 0.05,
-        "FRONTAGE": 0.05
+        "FRONTAGE": 0.05,
     }
 
-    linear = (
-        W["NOY"] * z_noy +
-        W["GROWTH"] * z_growth +
-        W["VACANCY"] * (1 - z_vac) +
+    # Linear blend of standardised features + raw [0..1] sun/frontage proxies
+    blended = (
+        W["NOY"]       * z_noy +
+        W["GROWTH"]    * z_growth +
+        W["VACANCY"]   * (1 - z_vac) +  # lower vacancy is better → (1 - z)
         W["LIQUIDITY"] * z_liq +
-        W["RISK"] * z_risk +
-        W["SUN"] * props["SUN_SCORE"].astype(float) +
-        W["FRONTAGE"] * props["FRONTAGE_RATIO"].astype(float)
+        W["RISK"]      * z_risk +
+        W["SUN"]       * props["SUN_SCORE"].astype(float) +
+        W["FRONTAGE"]  * props["FRONTAGE_RATIO"].astype(float)
     )
 
-    props["SALY"] = _minmax0100(linear)
+    # Friendly 0–100 SALY for easy sorting/comms
+    props["SALY"] = scale_0_100(blended)
 
-    # Output
-    keep_cols = [
-        "address","suburb","price","weekly_rent",
-        "NOY","GROWTH","VACANCY","LIQ_SALES","RISK","SUN_SCORE","FRONTAGE_RATIO",
-        "days_on_market","SALY"
+    # ---- 7) Save a compact, sorted output table ----
+    columns_to_keep = [
+        "address", "suburb", "price", "weekly_rent",
+        "NOY", "GROWTH", "VACANCY", "LIQ_SALES", "RISK",
+        "SUN_SCORE", "FRONTAGE_RATIO", "days_on_market",
+        "SALY",
     ]
-    keep_cols = [c for c in keep_cols if c in props.columns]
-    props[keep_cols].sort_values("SALY", ascending=False).to_csv(args.output, index=False)
+    columns_to_keep = [c for c in columns_to_keep if c in props.columns]
 
+    props[columns_to_keep].sort_values("SALY", ascending=False).to_csv(args.output, index=False)
     print(f"[ok] Wrote {args.output}")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
