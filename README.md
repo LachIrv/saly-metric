@@ -107,15 +107,15 @@ PY
 ### Notation
 - $P$: price  
 - $R_w$: weekly rent  
-- \( v \in [0,1] \): vacancy rate  
+- $v \in [0,1] \$: vacancy rate  
 - Annual costs = council + insurance + strata + maintenance\_pct × \(P\)
 
 ### 1) Net Operating Yield (NOY)
 Annual rent after vacancy: $R_a = 52\cdot R_w \cdot (1 - v)$
 
-\[
+$
 \text{NOY} = \frac{R_a - \text{annual\_costs}}{P}
-\]
+$
 
 ### 2) Growth (CAGR by area)
 Compute median sale price per **area × year** from transactions; pick latest year \(Y_1\) and base \(Y_0\in\{Y_1-N,\text{earliest}\}\):
